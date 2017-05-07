@@ -44,7 +44,7 @@ in considerably more detail
 ### What makes Automat different? ###
 
 There are
-[dozens of libraries on PyPI implementing state machines](https://warehouse.python.org/search/project/?q=finite+state+machine).
+[dozens of libraries on PyPI implementing state machines](https://pypi.org/search/?q=finite+state+machine).
 So it behooves me to say why yet another one would be a good idea.
 
 Automat is designed around this principle: while organizing your code around
@@ -132,8 +132,7 @@ decorated with `machine.state`:
     # When we have beans, upon pressing the brew button, we will then not have
     # beans any more (as they have been entered into the brewing chamber) and
     # our output will be heating the heating element.
-
-    have_beans.upon(put_in_beans, enter=dont_have_beans,
+    have_beans.upon(brew_button, enter=dont_have_beans,
                     outputs=[_heat_the_heating_element])
 ```
 
@@ -141,9 +140,9 @@ To *users* of this coffee machine class though, it still looks like a POPO
 (Plain Old Python Object):
 
 ```python
->>> coffeeMachine = CoffeeMachine()
->>> coffeeMachine.put_in_beans()
->>> coffeeMachine.brew_button()
+>>> coffee_machine = CoffeeMachine()
+>>> coffee_machine.put_in_beans()
+>>> coffee_machine.brew_button()
 ```
 
 All of the *inputs* are provided by calling them like methods, all of the
@@ -152,12 +151,271 @@ outputs specified to `upon` and all of the states are simply opaque tokens -
 although the fact that they're defined as methods like inputs and outputs
 allows you to put docstrings on them easily to document them.
 
+## How do I get the current state of a state machine?
+
+Don't do that.
+
+One major reason for having a state machine is that you want the callers of the
+state machine to just provide the appropriate input to the machine at the
+appropriate time, and *not have to check themselves* what state the machine is
+in.  So if you are tempted to write some code like this:
+
+```python
+if connection_state_machine.state == "CONNECTED":
+    connection_state_machine.send_message()
+else:
+    print("not connected")
+```
+
+Instead, just make your calling code do this:
+
+```python
+connection_state_machine.send_message()
+```
+
+and then change your state machine to look like this:
+
+```python
+    @machine.state()
+    def connected(self):
+        "connected"
+    @machine.state()
+    def not_connected(self):
+        "not connected"
+    @machine.input()
+    def send_message(self):
+        "send a message"
+    @machine.output()
+    def _actually_send_message(self):
+        self._transport.send(b"message")
+    @machine.output()
+    def _report_sending_failure(self):
+        print("not connected")
+    connected.upon(send_message, enter=connected, [_actually_send_message])
+    not_connected.upon(send_message, enter=not_connected, [_report_sending_failure])
+```
+
+so that the responsibility for knowing which state the state machine is in
+remains within the state machine itself.
+
+## Input for Inputs and Output for Outputs
+
+Quite often you want to be able to pass parameters to your methods, as well as
+inspecting their results.  For example, when you brew the coffee, you might
+expect a cup of coffee to result, and you would like to see what kind of coffee
+it is.  And if you were to put delicious hand-roasted small-batch artisanal
+beans into the machine, you would expect a *better* cup of coffee than if you
+were to use mass-produced beans.  You would do this in plain old Python by
+adding a parameter, so that's how you do it in Automat as well.
+
+```python
+    @_machine.input()
+    def put_in_beans(self, beans):
+        "The user put in some beans."
+```
+
+However, one important difference here is that *we can't add any
+implementation code to the input method*.  Inputs are purely a declaration of
+the interface; the behavior must all come from outputs.  Therefore, the change
+in the state of the coffee machine must be represented as an output.  We can
+add an output method like this:
+
+```python
+    @_machine.output()
+    def _save_beans(self, beans):
+        "The beans are now in the machine; save them."
+        self._beans = beans
+```
+
+and then connect it to the `put_in_beans` by changing the transition from
+`dont_have_beans` to `have_beans` like so:
+
+```python
+    dont_have_beans.upon(put_in_beans, enter=have_beans,
+                         outputs=[_save_beans])
+```
+
+Now, when you call:
+
+```python
+coffee_machine.put_in_beans("real good beans")
+```
+
+the machine will remember the beans for later.
+
+So how do we get the beans back out again?  One of our outputs needs to have a
+return value.  It would make sense if our `brew_button` method returned the cup
+of coffee that it made, so we should add an output.  So, in addition to heating
+the heating element, let's add a return value that describes the coffee.  First
+a new output:
+
+```python
+    @_machine.output()
+    def _describe_coffee(self):
+        return "A cup of coffee made with {}.".format(self._beans)
+```
+
+Note that we don't need to check first whether `self._beans` exists or not,
+because we can only reach this output method if the state machine says we've
+gone through a set of states that sets this attribute.
+
+Now, we need to hook up `_describe_coffee` to the process of brewing, so change
+the brewing transition to:
+
+```python
+    have_beans.upon(brew_button, enter=dont_have_beans,
+                    outputs=[_heat_the_heating_element,
+                             _describe_coffee])
+```
+
+Now, we can call it:
+
+```python
+>>> coffee_machine.brew_button()
+[None, 'A cup of coffee made with real good beans.']
+```
+
+Except... wait a second, what's that `None` doing there?
+
+Since every input can produce multiple outputs, in automat, the default return
+value from every input invocation is a `list`.  In this case, we have both
+`_heat_the_heating_element` and `_describe_coffee` outputs, so we're seeing
+both of their return values.  However, this can be customized, with the
+`collector` argument to `upon`; the `collector` is a callable which takes an
+iterable of all the outputs' return values and "collects" a single return value
+to return to the caller of the state machine.
+
+In this case, we only care about the last output, so we can adjust the call to
+`upon` like this:
+
+```python
+    have_beans.upon(brew_button, enter=dont_have_beans,
+                    outputs=[_heat_the_heating_element,
+                             _describe_coffee],
+                    collector=lambda iterable: list(iterable)[-1]
+    )
+```
+
+And now, we'll get just the return value we want:
+
+```python
+>>> coffee_machine.brew_button()
+'A cup of coffee made with real good beans.'
+```
+
+## If I can't get the state of the state machine, how can I save it to (a database, an API response, a file on disk...)
+
+There are APIs for serializing the state machine.
+
+First, you have to decide on a persistent representation of each state, via the
+`serialized=` argument to the `MethodicalMachine.state()` decorator.
+
+Let's take this very simple "light switch" state machine, which can be on or
+off, and flipped to reverse its state:
+
+```python
+class LightSwitch(object):
+    machine = MethodicalMachine()
+    @machine.state(serialized="on")
+    def on_state(self):
+        "the switch is on"
+    @machine.state(serialized="off", initial=True)
+    def off_state(self):
+        "the switch is off"
+    @machine.input()
+    def flip(self):
+        "flip the switch"
+    on_state.upon(flip, enter=off_state, outputs=[])
+    off_state.upon(flip, enter=on_state, outputs=[])
+```
+
+In this case, we've chosen a serialized representation for each state via the
+`serialized` argument.  The on state is represented by the string `"on"`, and
+the off state is represented by the string `"off"`.
+
+Now, let's just add an input that lets us tell if the switch is on or not.
+
+```python
+    @machine.input()
+    def query_power(self):
+        "return True if powered, False otherwise"
+    @machine.output()
+    def _is_powered(self):
+        return True
+    @machine.output()
+    def _not_powered(self):
+        return False
+    on_state.upon(query_power, enter=on_state, outputs=[_is_powered],
+                  collector=next)
+    off_state.upon(query_power, enter=off_state, outputs=[_not_powered],
+                   collector=next)
+```
+
+To save the state, we have the `MethodicalMachine.serializer()` method.  A
+method decorated with `@serializer()` gets an extra argument injected at the
+beginning of its argument list: the serialized identifier for the state.  In
+this case, either `"on"` or `"off"`.  Since state machine output methods can
+also affect other state on the object, a serializer method is expected to
+return *all* relevant state for serialization.
+
+For our simple light switch, such a method might look like this:
+
+```python
+    @machine.serializer()
+    def save(self, state):
+        return {"is-it-on": state}
+```
+
+Serializers can be public methods, and they can return whatever you like.  If
+necessary, you can have different serializers - just multiple methods decorated
+with `@machine.serializer()` - for different formats; return one data-structure
+for JSON, one for XML, one for a database row, and so on.
+
+When it comes time to unserialize, though, you generally want a private method,
+because an unserializer has to take a not-fully-initialized instance and
+populate it with state.  It is expected to *return* the serialized machine
+state token that was passed to the serializer, but it can take whatever
+arguments you like.  Of course, in order to return that, it probably has to
+take it somewhere in its arguments, so it will generally take whatever a paired
+serializer has returned as an argument.
+
+So our unserializer would look like this:
+
+```python
+    @machine.unserializer()
+    def _restore(self, blob):
+        return blob["is-it-on"]
+```
+
+Generally you will want a classmethod deserialization constructor which you
+write yourself to call this, so that you know how to create an instance of your
+own object, like so:
+
+```python
+    @classmethod
+    def from_blob(cls, blob):
+        self = cls()
+        self._restore(blob)
+        return self
+```
+
+Saving and loading our `LightSwitch` along with its state-machine state can now
+be accomplished as follows:
+
+```python
+>>> switch1 = LightSwitch()
+>>> switch1.query_power()
+False
+>>> switch1.flip()
+[]
+>>> switch1.query_power()
+True
+>>> blob = switch1.save()
+>>> switch2 = LightSwitch.from_blob(blob)
+>>> switch2.query_power()
+True
+```
+
 More comprehensive (tested, working) examples are present in `docs/examples`.
 
-### What is the status of Automat? ###
-
-It is currently a rough prototype, but it may quickly come to be relied upon by
-some intensely real software, so stay tuned for more developments soon.
-
-
-
+Go forth and machine all the state!

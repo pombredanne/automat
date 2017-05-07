@@ -3,9 +3,11 @@
 Tests for the public interface of Automat.
 """
 
+from functools import reduce
 from unittest import TestCase
 
-from .. import MethodicalMachine
+from .. import MethodicalMachine, NoTransition
+from .. import _methodical
 
 class MethodicalTests(TestCase):
     """
@@ -128,8 +130,10 @@ class MethodicalTests(TestCase):
             @b.state(initial=True)
             def initialB(self):
                 "initial B"
+            @a.output()
             def outputA(self):
                 return "A"
+            @b.output()
             def outputB(self):
                 return "B"
             initialA.upon(inputA, initialA, [outputA])
@@ -138,6 +142,31 @@ class MethodicalTests(TestCase):
         mm = MultiMach()
         self.assertEqual(mm.inputA(), ["A"])
         self.assertEqual(mm.inputB(), ["B"])
+
+
+    def test_collectOutputs(self):
+        """
+        Outputs can be combined with the "collector" argument to "upon".
+        """
+        import operator
+        class Machine(object):
+            m = MethodicalMachine()
+            @m.input()
+            def input(self):
+                "an input"
+            @m.output()
+            def outputA(self):
+                return "A"
+            @m.output()
+            def outputB(self):
+                return "B"
+            @m.state(initial=True)
+            def state(self):
+                "a state"
+            state.upon(input, state, [outputA, outputB],
+                       collector=lambda x: reduce(operator.add, x))
+        m = Machine()
+        self.assertEqual(m.input(), "AB")
 
 
     def test_methodName(self):
@@ -157,7 +186,313 @@ class MethodicalTests(TestCase):
             m.declaredInputName("too", "many", "arguments")
         self.assertIn("declaredInputName", str(cm.exception))
 
-# FIXME: error for more than one initial state
+
+    def test_inputWithArguments(self):
+        """
+        If an input takes an argument, it will pass that along to its output.
+        """
+        class Mechanism(object):
+            m = MethodicalMachine()
+            @m.input()
+            def input(self, x, y=1):
+                "an input"
+            @m.state(initial=True)
+            def state(self):
+                "a state"
+            @m.output()
+            def output(self, x, y=1):
+                self._x = x
+                return x + y
+            state.upon(input, state, [output])
+
+        m = Mechanism()
+        self.assertEqual(m.input(3), [4])
+        self.assertEqual(m._x, 3)
+
+
+    def test_inputFunctionsMustBeEmpty(self):
+        """
+        The wrapped input function must have an empty body.
+        """
+        # input functions are executed to assert that the signature matches,
+        # but their body must be empty
+
+        _methodical._empty() # chase coverage
+        _methodical._docstring()
+
+        class Mechanism(object):
+            m = MethodicalMachine()
+            with self.assertRaises(ValueError) as cm:
+                @m.input()
+                def input(self):
+                    "an input"
+                    list() # pragma: no cover
+            self.assertEqual(str(cm.exception), "function body must be empty")
+
+        # all three of these cases should be valid. Functions/methods with
+        # docstrings produce slightly different bytecode than ones without.
+
+        class MechanismWithDocstring(object):
+            m = MethodicalMachine()
+            @m.input()
+            def input(self):
+                "an input"
+            @m.state(initial=True)
+            def start(self):
+                "starting state"
+            start.upon(input, enter=start, outputs=[])
+        MechanismWithDocstring().input()
+
+        class MechanismWithPass(object):
+            m = MethodicalMachine()
+            @m.input()
+            def input(self):
+                pass
+            @m.state(initial=True)
+            def start(self):
+                "starting state"
+            start.upon(input, enter=start, outputs=[])
+        MechanismWithPass().input()
+
+        class MechanismWithDocstringAndPass(object):
+            m = MethodicalMachine()
+            @m.input()
+            def input(self):
+                "an input"
+                pass
+            @m.state(initial=True)
+            def start(self):
+                "starting state"
+            start.upon(input, enter=start, outputs=[])
+        MechanismWithDocstringAndPass().input()
+
+        class MechanismReturnsNone(object):
+            m = MethodicalMachine()
+            @m.input()
+            def input(self):
+                return None
+            @m.state(initial=True)
+            def start(self):
+                "starting state"
+            start.upon(input, enter=start, outputs=[])
+        MechanismReturnsNone().input()
+
+        class MechanismWithDocstringAndReturnsNone(object):
+            m = MethodicalMachine()
+            @m.input()
+            def input(self):
+                "an input"
+                return None
+            @m.state(initial=True)
+            def start(self):
+                "starting state"
+            start.upon(input, enter=start, outputs=[])
+        MechanismWithDocstringAndReturnsNone().input()
+
+
+
+    def test_inputOutputMismatch(self):
+        """
+        All the argument lists of the outputs for a given input must match; if
+        one does not the call to C{upon} will raise a C{TypeError}.
+        """
+        class Mechanism(object):
+            m = MethodicalMachine()
+            @m.input()
+            def nameOfInput(self, a):
+                "an input"
+            @m.output()
+            def outputThatMatches(self, a):
+                "an output that matches"
+            @m.output()
+            def outputThatDoesntMatch(self, b):
+                "an output that doesn't match"
+            @m.state()
+            def state(self):
+                "a state"
+            with self.assertRaises(TypeError) as cm:
+                state.upon(nameOfInput, state, [outputThatMatches,
+                                                outputThatDoesntMatch])
+            self.assertIn("nameOfInput", str(cm.exception))
+            self.assertIn("outputThatDoesntMatch", str(cm.exception))
+
+
+    def test_multipleInitialStatesFailure(self):
+        """
+        A L{MethodicalMachine} can only have one initial state.
+        """
+
+        class WillFail(object):
+            m = MethodicalMachine()
+
+            @m.state(initial=True)
+            def firstInitialState(self):
+                "The first initial state -- this is OK."
+
+            with self.assertRaises(ValueError):
+                @m.state(initial=True)
+                def secondInitialState(self):
+                    "The second initial state -- results in a ValueError."
+
+
+    def test_multipleTransitionsFailure(self):
+        """
+        A L{MethodicalMachine} can only have one transition per start/event
+        pair.
+        """
+
+        class WillFail(object):
+            m = MethodicalMachine()
+
+            @m.state(initial=True)
+            def start(self):
+                "We start here."
+            @m.state()
+            def end(self):
+                "Rainbows end."
+
+            @m.input()
+            def event(self):
+                "An event."
+            start.upon(event, enter=end, outputs=[])
+            with self.assertRaises(ValueError):
+                start.upon(event, enter=end, outputs=[])
+
+    def test_badTransitionForCurrentState(self):
+        """
+        Calling any input method that lacks a transition for the machine's
+        current state raises an informative L{NoTransition}.
+        """
+
+        class OnlyOnePath(object):
+            m = MethodicalMachine()
+            @m.state(initial=True)
+            def start(self):
+                "Start state."
+            @m.state()
+            def end(self):
+                "End state."
+            @m.input()
+            def advance(self):
+                "Move from start to end."
+            @m.input()
+            def deadEnd(self):
+                "A transition from nowhere to nowhere."
+            start.upon(advance, end, [])
+
+        machine = OnlyOnePath()
+        with self.assertRaises(NoTransition) as cm:
+            machine.deadEnd()
+        self.assertIn("deadEnd", str(cm.exception))
+        self.assertIn("start", str(cm.exception))
+        machine.advance()
+        with self.assertRaises(NoTransition) as cm:
+            machine.deadEnd()
+        self.assertIn("deadEnd", str(cm.exception))
+        self.assertIn("end", str(cm.exception))
+
+
+    def test_saveState(self):
+        """
+        L{MethodicalMachine.serializer} is a decorator that modifies its
+        decoratee's signature to take a "state" object as its first argument,
+        which is the "serialized" argument to the L{MethodicalMachine.state}
+        decorator.
+        """
+
+        class Mechanism(object):
+            m = MethodicalMachine()
+            def __init__(self):
+                self.value = 1
+            @m.state(serialized="first-state", initial=True)
+            def first(self):
+                "First state."
+            @m.state(serialized="second-state")
+            def second(self):
+                "Second state."
+            @m.serializer()
+            def save(self, state):
+                return {
+                    'machine-state': state,
+                    'some-value': self.value,
+                }
+
+        self.assertEqual(
+            Mechanism().save(),
+            {
+                "machine-state": "first-state",
+                "some-value": 1,
+            }
+        )
+
+    def test_restoreState(self):
+        """
+        L{MethodicalMachine.unserializer} decorates a function that becomes a
+        machine-state unserializer; its return value is mapped to the
+        C{serialized} parameter to C{state}, and the L{MethodicalMachine}
+        associated with that instance's state is updated to that state.
+        """
+
+        class Mechanism(object):
+            m = MethodicalMachine()
+            def __init__(self):
+                self.value = 1
+                self.ranOutput = False
+            @m.state(serialized="first-state", initial=True)
+            def first(self):
+                "First state."
+            @m.state(serialized="second-state")
+            def second(self):
+                "Second state."
+            @m.input()
+            def input(self):
+                "an input"
+            @m.output()
+            def output(self):
+                self.value = 2
+                self.ranOutput = True
+                return 1
+            @m.output()
+            def output2(self):
+                return 2
+            first.upon(input, second, [output],
+                       collector=lambda x: list(x)[0])
+            second.upon(input, second, [output2],
+                        collector=lambda x: list(x)[0])
+            @m.serializer()
+            def save(self, state):
+                return {
+                    'machine-state': state,
+                    'some-value': self.value,
+                }
+
+            @m.unserializer()
+            def _restore(self, blob):
+                self.value = blob['some-value']
+                return blob['machine-state']
+
+            @classmethod
+            def fromBlob(cls, blob):
+                self = cls()
+                self._restore(blob)
+                return self
+
+        m1 = Mechanism()
+        m1.input()
+        blob = m1.save()
+        m2 = Mechanism.fromBlob(blob)
+        self.assertEqual(m2.ranOutput, False)
+        self.assertEqual(m2.input(), 2)
+        self.assertEqual(
+            m2.save(),
+            {
+                'machine-state': 'second-state',
+                'some-value': 2,
+            }
+        )
+
+
+
 # FIXME: error for wrong types on any call to _oneTransition
 # FIXME: better public API for .upon; maybe a context manager?
 # FIXME: when transitions are defined, validate that we can always get to
